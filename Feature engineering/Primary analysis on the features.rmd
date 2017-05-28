@@ -1,0 +1,187 @@
+---
+title: "Primary Feature analysis"
+author: "Yuxuan Chen"
+date: "May 10, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(lattice)
+library(tabplot)
+library(corrplot)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#### Basic data information before analysis
+```{r,tidy=TRUE}
+#Load "train.csv"
+train <- read.csv("train.csv")
+
+paste("The dimensions of the",class(train), "'train' are", dim(train)[1], "by",dim(train)[2])
+paste("Of the",dim(train)[2],"variables,", sum(sapply(train,is.numeric)),"of them are numeric")
+paste("And", sum(sapply(train,is.factor)),"of them are categorical")
+```
+In order to find out the features with strongest predictiing power, the correlations between SalePric and other features need to be examined.
+
+###*1.1 Numeric data*
+
+Pairwise corrections between numerical features can be calculated using cor() function and displayed using corrplot(). In order to find out the most correlated features, I first filter the correlation coefficients by their absolute value. 
+
+
+```{r}
+trainCont <- train[sapply(train,is.numeric)]
+correlations <- cor(trainCont[, -1], use = "pairwise.complete.obs")
+# The last row of matrix "correlation" is between SalePrice and other features
+PriceCor <- correlations[37,]
+# Choose the coefficients whose absolute value is greater than 0.5, and display
+sort(PriceCor[which(abs(PriceCor)>0.5 & PriceCor !=1)],decreasing = TRUE)
+strongCorr <- cor(train[names(which(abs(PriceCor)>0.5))], use = "pairwise.complete.obs")
+corrplot(strongCorr, method = "square")
+```
+
+Simply picking the first a few features from the above sorted list seems problematic for two reasons. First, there are feature clustering, or features dependent on each other, which should be examined more carefully and even feature engineered.To be more specific, there are three pairs of features that have strong correlations(dark squares off-diagonal but not on the last row/column):  
+(X1stFlrSF, TotalBsmtSF), (TotRmsAbvGrd, GrLivArea), (GarageArea, GarageCars).
+So in my opinion only one in each pair, or a new feature engineered from them, should be included when building the price predicting model.
+
+Second, the "OverallQual" feature, which takes discrete integer values 1 to 10, looks more like a factor/categorical feature.
+
+Therefore, based on "correlation coefficient greater than 0.5" filtering and the above reasoning, the features left are:
+
+#### $1. GriLivArea(including TotRmsAbvGrd)
+#### $2. GarageCars(including GarageArea)
+#### $3. TotalBsmtSF(including X1stFlrSF)
+#### $4. FullBath
+#### $5. YearBuilt
+
+###*1.2 Categorial data*
+
+Correlations between categorical data and SalePrice can be visualized using tableplot(). All 44 categorical features' names are listed below, but only the last 8 categorical features are plotted as an example:
+
+```{r}
+# Save the OverallQual as factor and add a new column to the data frame
+train[,"FactorQual"] <- factor(train$OverallQual)
+factorNames<-names(train)[which(sapply(train,is.factor))]
+factorNames
+tableplot(train,select_string = c("SalePrice",factorNames[37:44]))
+```
+
+
+
+#### $ Kick out the features with too many NAs
+
+If there are too many NAs in one feature, it cannot be used for modeling. Simply ignoring the NAs may very likely introduce bias. The features listed below should be kicked out of the price prediction model, using 5% criteria:
+
+```{r}
+catTrain <- train[sapply(train,is.factor)]
+# Print the column names which has too many NAs
+names(catTrain[sapply(catTrain, function(x) {sum(is.na(x))/1460})>0.05])
+#Save the rest columns in a new data frame
+completeCatTrain <- catTrain[sapply(catTrain, function(x) {sum(is.na(x))/length(train$SalePrice)})<0.05]
+```
+
+
+
+#### $ How to quantify correlation for categorical features?
+
+Intuitively, a price-correlated feature will appear like "cocktail" in the table plot. This can be illustrated in the following example. Suppose there is a imaginary factor called PriceQuartile, which has 4 values, 1,2,3,4 when the price of the house is in the 1st, 2nd, 3rd, 4th quartile of the price, respectively. Obviously, such feature is directly correlated to the price, and it will be a perfect cocktail with four levels in the tableplot, each taking up a quarter of the map. 
+
+For real features in the tableplot, perfectly "cocktail"-like horizontal boundaries between categories are not practical, but as long as they are not verticle, they are correlated to the SalePrice.
+
+How can one quantify the correlation, or the "cocktail"ness? In the "cocktail" example, the maximum in the 1st quartile is smaller than the minimum of the 2nd quartile. Practically, in the bwplot of a certain feature, if the highest level's quartile box does not have overlap with that of the lowest level, then such feature can be considered correlated to the price. This argument is illustrated below, using ExterQual and LotConfig features. The tableplot of ExterQual is not vertical, but that of LotConfig is almost vertical.
+
+```{r}
+bwplot(ExterQual ~ SalePrice,data = train)
+bwplot(LotConfig ~ SalePrice,data = train)
+```
+
+Quite evidently, houses with excellent external quality have much higher SalePrice than the low ExterQual ones. But different LotConfig categories do not have significantly different SalePrice.
+
+
+#### Applying the "quartile boxes no overlap"" rule.
+
+```{r}
+#This is an implementation of the quartile box no overlap rule
+IsCorr <- function(numData,catData,q=0.25) {
+  # use tapply() and quantile() to judge 
+  # if a categorical feature is correlated to the numerical feature
+  qQuantile <- c(q,0.5,1-q)
+  #tapply returns to a list,
+  #which is converted to matrix
+  #columns are the quantile(q,0.5,1-q) of each level in this category
+  catCorrM <- matrix(unlist(tapply(numData,catData,quantile,qQuantile)),nrow = 3)
+  
+  # compare
+  # Q1 of the level with maximum mean 
+  # Q3 of the level with minimum mean
+  # if Q1_max > Q3_min (Correlated = TRUE)
+  catCorrM[1,catCorrM[2,]==max(catCorrM[2,])] > catCorrM[3,catCorrM[2,]==min(catCorrM[2,])]
+}
+
+# Here the work begins
+# define a vector storing boolean values
+# with each element indicating if the corresponding feature satisfies the rule
+cplCatCorrLogic <- c()
+# Maybe there is better way to do the work instead of for loop!!
+for (i in names(completeCatTrain)) {
+  cplCatCorrLogic[i] <- IsCorr(train$SalePrice,completeCatTrain[i],q=0.25)
+}
+# give the vector column names for future reference
+names(cplCatCorrLogic) <- names(completeCatTrain)
+# count how many features are good
+sum(cplCatCorrLogic)
+# print out the good features' names
+names(which(cplCatCorrLogic))
+# save the good features in a new data frame
+CorrTrain1 <- catTrain[names(which(cplCatCorrLogic))]
+tableplot(train,select_string = c("SalePrice",names(completeCatTrain[which(cplCatCorrLogic)])))
+```
+
+#### One more problem: level population too small
+
+After the previous two filtering steps, there are still a few feature that do not show correlation to the SalePrice. For example, in the "Condition2" column, the 4th in the tableplot, vast majority of data is in one category. Though it survived the quantile criteria, the quantiles calculated are not statistically meaningful at all, since the population in the levels with maximum and minimum average SalePrice is too small. It's natural to add one more rule to the filtering: 
+
+##### *Kick out the features who has only one level of more than 10% population.*
+
+The new filtering result is shown below:
+
+```{r}
+# CorrTain1 is the filtered data frame data
+# apply the new filtering function(x) to each column of CorrTrain1
+# function(x): whether the number of (>5%)levels is larger than one, return T/F
+lvlPopLogic <- sapply(CorrTrain1, function(x) {sum(table(x)>length(x)*0.1)>1})
+
+# Print out and example
+paste("train$Condition2 satisfies quantile rule?")
+IsCorr(train$SalePrice,train$Condition2)
+
+paste("Does it have more than one levels with >5% population?")
+sum(table(CorrTrain1$Condition2)>length(CorrTrain1$Condition2)*0.1)>1
+
+paste("Number of survived categories: ", sum(lvlPopLogic))
+paste("They are: ")
+names(which(lvlPopLogic))
+tableplot(train,select_string = c("SalePrice",names(CorrTrain1[which(lvlPopLogic)])))
+```
+
+
+Now within these 13 categories, one can find some repeated patterns in the tableplot. (HeatingQC, Foundation,HouseStyle) are similar, probably because one is dependent on the other, which makes sense but requires more domain knowledge to fully understand.(Kitch,ExterQ,BsmtQ) are similar, which are probably related to the how organized the previous owner is. (Exterior1,Exterior2) are also very similar probably because one is dependent on the other. Similar to what I did to the numeric features, I only pick one from each of these groups into "the Top 5":
+
+#### $1 OverallQual (as factor)
+#### $2 Neighborhood
+#### $3 ExterQual (including KitchenQual, and BsmtQual)
+#### $4 HouseStyle (including Foundation, MasVnrType and HeatingQC)
+#### $5 Exterior1st (including Exterior2nd)
+
+```{r}
+tableplot(train,select_string = c("SalePrice","FactorQual","Neighborhood","ExterQual","HouseStyle",
+  "Exterior1st"), sortCol = "ExterQual")
+```
+
+
+This figure is an example of how a categorical feature can influence the house price. The sorting feature is ExterQual, which is a perfect cocktail. It's quite obvious that, in different levels, the mean and quartile boxes of the SalePrice are significantly different.
+
+
